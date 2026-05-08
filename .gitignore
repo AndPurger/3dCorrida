@@ -6,6 +6,10 @@ __pycache__/
 dist/
 build/
 
+# Generated outputs
+*.stl
+*.npy
+
 # Virtual environment
 .venv/
 venv/

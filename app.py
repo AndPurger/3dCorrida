@@ -4,6 +4,7 @@ import os
 import plotly.graph_objects as go
 import importlib
 import numpy as np
+import geopandas as gpd
 
 # Force reload modules every run
 import core.gpx_parser
@@ -164,10 +165,17 @@ uploaded_file = st.sidebar.file_uploader("📂 Upload GPX File", type=['gpx'])
 if uploaded_file is not None:
     gpx_content = uploaded_file.getvalue().decode("utf-8")
 
+    # Status tracker
+    status = {
+        'gpx': False, 'streets': False, 'buildings': False,
+        'terrain': False, 'route': False,
+        'streets_count': 0, 'buildings_count': 0,
+        'errors': []
+    }
+
     # ─ 1) Parse GPX ─
     with st.spinner("📍 Parsing GPX..."):
         parser = GPXParser(gpx_content)
-        # Use border_pct to calculate margin in degrees (approximate)
         points = parser.get_points()
         lats = [p[0] for p in points]
         lons = [p[1] for p in points]
@@ -176,10 +184,11 @@ if uploaded_file is not None:
         margin_deg = max(lat_range, lon_range) * (border_pct / 100.0)
 
         bbox = parser.get_bounding_box(margin=margin_deg)
-        gpx_gdf = parser.get_geodataframe()       # 3D (with elevation)
-        gpx_gdf_2d = parser.get_geodataframe_2d()  # 2D (for CRS estimation)
+        gpx_gdf = parser.get_geodataframe()
+        gpx_gdf_2d = parser.get_geodataframe_2d()
         local_crs = gpx_gdf_2d.estimate_utm_crs()
         gpx_gdf_proj = gpx_gdf.to_crs(local_crs)
+        status['gpx'] = True
 
     st.success(f"✅ GPX: {len(points)} pontos | CRS: {local_crs}")
 
@@ -187,51 +196,64 @@ if uploaded_file is not None:
     st.subheader("🗺️ Downloading Map Data")
     map_gen = MapGenerator(bbox)
 
-    streets_gdf = map_gen.get_streets()
-    has_streets = not getattr(streets_gdf, 'empty', True)
-    if has_streets:
-        streets_gdf = streets_gdf.to_crs(local_crs)
+    try:
+        streets_gdf = map_gen.get_streets()
+        has_streets = not getattr(streets_gdf, 'empty', True)
+        if has_streets:
+            streets_gdf = streets_gdf.to_crs(local_crs)
+            status['streets'] = True
+            status['streets_count'] = len(streets_gdf)
+    except Exception as e:
+        st.error(f"❌ Erro ao baixar ruas: {type(e).__name__}: {e}")
+        status['errors'].append(f"Streets: {e}")
+        streets_gdf = gpd.GeoDataFrame()
+        has_streets = False
 
     buildings_gdf = None
     has_buildings = False
     if fetch_buildings:
-        buildings_gdf = map_gen.get_buildings()
-        has_buildings = not getattr(buildings_gdf, 'empty', True)
-        if has_buildings:
-            buildings_gdf = buildings_gdf.to_crs(local_crs)
+        try:
+            buildings_gdf = map_gen.get_buildings()
+            has_buildings = not getattr(buildings_gdf, 'empty', True)
+            if has_buildings:
+                buildings_gdf = buildings_gdf.to_crs(local_crs)
+                status['buildings'] = True
+                status['buildings_count'] = len(buildings_gdf)
+        except Exception as e:
+            st.error(f"❌ Erro ao baixar prédios: {type(e).__name__}: {e}")
+            status['errors'].append(f"Buildings: {e}")
+            buildings_gdf = gpd.GeoDataFrame()
+            has_buildings = False
 
     # ─ 2.5) Transform Geometries to Physical Printer Space (mm) ─
-    bounds = gpx_gdf_proj.total_bounds  # [minx, miny, maxx, maxy] in meters
+    bounds = gpx_gdf_proj.total_bounds
     cx = (bounds[0] + bounds[2]) / 2.0
     cy = (bounds[1] + bounds[3]) / 2.0
     dx = bounds[2] - bounds[0]
     dy = bounds[3] - bounds[1]
-    
-    # Clip OSM features exactly to the map area (plus border) so long highways don't shoot out
+
     margin_pct_dec = border_pct / 100.0
     margin_x = dx * margin_pct_dec
     margin_y = dy * margin_pct_dec
-    
+
     from shapely.geometry import box
-    clip_poly = box(bounds[0] - margin_x, bounds[1] - margin_y, 
+    clip_poly = box(bounds[0] - margin_x, bounds[1] - margin_y,
                     bounds[2] + margin_x, bounds[3] + margin_y)
-                    
+
     if has_streets:
         streets_gdf = streets_gdf.clip(clip_poly)
     if has_buildings:
         buildings_gdf = buildings_gdf.clip(clip_poly)
 
-    # Calculate scale so that the max bounding box size fits exactly max_print_size
     max_extent_meters = max(dx, dy)
     if max_extent_meters == 0: max_extent_meters = 1.0
     total_max_extent = max_extent_meters * (1.0 + 2 * margin_pct_dec)
-    
-    xy_scale = max_print_size / total_max_extent  # Factor to convert meters to scaled mm
-    
+
+    xy_scale = max_print_size / total_max_extent
+
     import shapely.affinity
     def transform_gdf_to_mm(gdf):
         if getattr(gdf, 'empty', True): return gdf
-        # MUST supply zfact=xy_scale and origin=(0,0,0) so GPX elevations scale down to printer mm!
         gdf['geometry'] = gdf.geometry.apply(lambda geom: shapely.affinity.scale(
             shapely.affinity.translate(geom, xoff=-cx, yoff=-cy),
             xfact=xy_scale, yfact=xy_scale, zfact=xy_scale, origin=(0, 0, 0)
@@ -242,79 +264,121 @@ if uploaded_file is not None:
     if has_streets: streets_gdf = transform_gdf_to_mm(streets_gdf)
     if has_buildings: buildings_gdf = transform_gdf_to_mm(buildings_gdf)
 
-    # ─ 3) Terrain elevation (optional — now with Mapzen tiles!) ─
+    # ─ 3) Terrain elevation ─
     terrain_interp = None
     terrain_mesh = None
     if enable_terrain:
         st.subheader("🏔️ Downloading Mapzen Elevation Tiles...")
-        with st.spinner("Fetching high-resolution terrain data from AWS..."):
-            elev_lats, elev_lons, elev_grid = fetch_elevation_grid(
-                bbox,
-                zoom=terrain_zoom,
-                dataset=terrain_dataset,
-                vertical_resolution=terrain_vert_res
-            )
-            terrain_mesh, xs_g, ys_g, zs_g = create_terrain_mesh(
-                elev_lats, elev_lons, elev_grid, local_crs,
-                cx=cx, cy=cy, xy_scale=xy_scale,
-                terrain_exaggeration=terrain_exag,
-                base_thickness=base_thickness,
-                hollow=hollow_base,
-                wall_thickness=wall_thickness
-            )
-            terrain_interp = TerrainInterpolator(xs_g, ys_g, zs_g)
+        try:
+            with st.spinner("Fetching high-resolution terrain data from AWS..."):
+                elev_lats, elev_lons, elev_grid = fetch_elevation_grid(
+                    bbox,
+                    zoom=terrain_zoom,
+                    dataset=terrain_dataset,
+                    vertical_resolution=terrain_vert_res
+                )
+                terrain_mesh, xs_g, ys_g, zs_g = create_terrain_mesh(
+                    elev_lats, elev_lons, elev_grid, local_crs,
+                    cx=cx, cy=cy, xy_scale=xy_scale,
+                    terrain_exaggeration=terrain_exag,
+                    base_thickness=base_thickness,
+                    hollow=hollow_base,
+                    wall_thickness=wall_thickness
+                )
+                terrain_interp = TerrainInterpolator(xs_g, ys_g, zs_g)
+                status['terrain'] = True
+        except Exception as e:
+            st.error(f"❌ Erro no terreno: {type(e).__name__}: {e}")
+            status['errors'].append(f"Terrain: {e}")
 
     # ─ 4) Build 3D Mesh ─
     st.subheader("🔧 Construindo Malha 3D")
-    with st.spinner("Extrudando geometrias..."):
-        builder = MeshBuilder()
 
-        # Configura o interpolador de terreno para ajustar as geometrias
-        if terrain_interp is not None:
-            builder.set_terrain(terrain_interp)
+    builder = MeshBuilder()
 
-        if terrain_mesh is not None:
-            # O próprio bloco sólido SRTM serve como base
-            builder.meshes.append(terrain_mesh)
-            mode_label = "🏔️ Terreno oco" if hollow_base else "🏔️ Terreno sólido"
-            st.write(f"{mode_label} gerado com sucesso")
-        else:
-            # Sem terreno: base plana
-            builder.create_base_plate(gpx_gdf_proj, thickness=base_thickness,
-                                      margin_pct=border_pct / 100.0)
+    if terrain_interp is not None:
+        builder.set_terrain(terrain_interp)
 
-        # Buildings (agora os prédios são geometrias "crisp" que seguem o relevo via centróide)
-        if has_buildings:
+    if terrain_mesh is not None:
+        builder.meshes.append(terrain_mesh)
+        mode_label = "🏔️ Terreno oco" if hollow_base else "🏔️ Terreno sólido"
+        st.write(f"{mode_label} gerado com sucesso")
+    else:
+        builder.create_base_plate(gpx_gdf_proj, thickness=base_thickness,
+                                  margin_pct=border_pct / 100.0)
+
+    # Buildings
+    n_buildings_added = 0
+    if has_buildings:
+        try:
             builder.add_gdf(buildings_gdf, base_height=0,
                             extrude_height=building_height,
                             color=[180, 180, 180, 255])
-            st.write(f"🏢 {len(buildings_gdf)} prédios extrudados")
+            n_buildings_added = len(buildings_gdf)
+            st.write(f"🏢 {n_buildings_added} prédios extrudados")
+        except Exception as e:
+            st.error(f"❌ Erro ao extrudar prédios: {e}")
+            status['errors'].append(f"Building extrusion: {e}")
 
-        # Streets
-        if has_streets:
+    # Streets
+    n_streets_added = 0
+    if has_streets:
+        try:
             streets_poly = streets_gdf.copy()
             streets_poly['geometry'] = streets_poly.geometry.buffer(streets_width)
             builder.add_gdf(streets_poly, base_height=0,
                             extrude_height=streets_height,
                             color=[140, 140, 140, 255])
-            st.write(f"🛣️ {len(streets_gdf)} ruas extrudadas")
+            n_streets_added = len(streets_gdf)
+            st.write(f"🛣️ {n_streets_added} ruas extrudadas")
+        except Exception as e:
+            st.error(f"❌ Erro ao extrudar ruas: {e}")
+            status['errors'].append(f"Street extrusion: {e}")
 
-        # GPX Route
+    # GPX Route (ALWAYS added)
+    try:
         gpx_poly = gpx_gdf_proj.copy()
         gpx_poly['geometry'] = gpx_poly.geometry.buffer(route_thickness)
         ref_line = gpx_gdf_proj.geometry.iloc[0]
         builder.add_gdf(gpx_poly, base_height=0, extrude_height=route_height,
                         color=[255, 200, 0, 255],
                         ref_linestring=ref_line, alt_exaggeration=route_alt_exag)
+        status['route'] = True
         st.write("🟡 Rota GPX destacada")
+    except Exception as e:
+        st.error(f"❌ Erro ao extrudar rota GPX: {e}")
+        status['errors'].append(f"Route: {e}")
 
-        final_mesh = builder.get_combined_mesh()
+    final_mesh = builder.get_combined_mesh()
+
+    # ── Status Panel ──
+    st.subheader("📊 Status da Geração")
+    status_cols = st.columns(5)
+    with status_cols[0]:
+        st.write("📍 GPX")
+        st.write("✅" if status['gpx'] else "❌")
+    with status_cols[1]:
+        st.write(f"🛣️ Ruas")
+        st.write(f"✅ {n_streets_added}" if status['streets'] else "❌ 0")
+    with status_cols[2]:
+        st.write(f"🏢 Prédios")
+        st.write(f"✅ {n_buildings_added}" if status['buildings'] else "❌ 0")
+    with status_cols[3]:
+        st.write("🏔️ Terreno")
+        st.write("✅" if status['terrain'] else ("⏭️ Off" if not enable_terrain else "❌"))
+    with status_cols[4]:
+        st.write("🟡 Rota")
+        st.write("✅" if status['route'] else "❌")
+
+    if status['errors']:
+        with st.expander("⚠️ Erros encontrados", expanded=True):
+            for err in status['errors']:
+                st.error(err)
 
     # ─ 5) Display + Export ─
     if final_mesh:
-        # Mesh statistics
         stats = MeshBuilder.get_mesh_stats(final_mesh)
-        
+
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Vértices", f"{stats['vertices']:,}")
@@ -334,12 +398,9 @@ if uploaded_file is not None:
         vertices = final_mesh.vertices
         faces = final_mesh.faces
 
-        # Color terrain by elevation for better visualization
         z_vals = vertices[:, 2]
         z_min, z_max = z_vals.min(), z_vals.max()
         z_range = z_max - z_min if z_max > z_min else 1.0
-
-        # Elevation-based intensity (0-1)
         intensity = (z_vals - z_min) / z_range
 
         fig = go.Figure(data=[
@@ -348,29 +409,20 @@ if uploaded_file is not None:
                 i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
                 intensity=intensity,
                 colorscale=[
-                    [0.0, 'rgb(40, 40, 50)'],       # Base dark
-                    [0.15, 'rgb(60, 80, 60)'],       # Low terrain green
-                    [0.3, 'rgb(80, 120, 70)'],       # Mid green
-                    [0.5, 'rgb(160, 160, 100)'],     # Transition
-                    [0.7, 'rgb(180, 140, 100)'],     # Brown
-                    [0.85, 'rgb(200, 180, 160)'],    # Light rock
-                    [1.0, 'rgb(240, 240, 240)'],     # Snow/peak
+                    [0.0, 'rgb(40, 40, 50)'],
+                    [0.15, 'rgb(60, 80, 60)'],
+                    [0.3, 'rgb(80, 120, 70)'],
+                    [0.5, 'rgb(160, 160, 100)'],
+                    [0.7, 'rgb(180, 140, 100)'],
+                    [0.85, 'rgb(200, 180, 160)'],
+                    [1.0, 'rgb(240, 240, 240)'],
                 ],
                 showscale=True,
-                colorbar=dict(
-                    title="Elevation",
-                    thickness=15,
-                    len=0.5,
-                ),
+                colorbar=dict(title="Elevation", thickness=15, len=0.5),
                 opacity=1.0,
                 flatshading=True,
-                lighting=dict(
-                    ambient=0.35,
-                    diffuse=0.85,
-                    roughness=0.4,
-                    specular=0.25,
-                    fresnel=0.15
-                ),
+                lighting=dict(ambient=0.35, diffuse=0.85, roughness=0.4,
+                              specular=0.25, fresnel=0.15),
                 lightposition=dict(x=100, y=200, z=300),
             )
         ])
@@ -405,8 +457,6 @@ if uploaded_file is not None:
             mime=mime_type,
         )
 
-        # Quick links for other formats
         st.caption("Outros formatos disponíveis no seletor da sidebar.")
-
     else:
         st.error("❌ Falha ao gerar a mesh. Verifique seu arquivo GPX.")
